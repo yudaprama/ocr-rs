@@ -2,9 +2,13 @@
 #include <MNN/Interpreter.hpp>
 #include <MNN/Tensor.hpp>
 #include <MNN/MNNDefine.h>
+#include <MNN/expr/Module.hpp>
+#include <MNN/expr/NeuralNetWorkOp.hpp>
+#include <MNN/expr/Executor.hpp>
 
 #include <cstring>
 #include <vector>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
@@ -738,4 +742,399 @@ MNNR_ErrorCode mnnr_run_inference_dynamic(
 void mnnr_free_output(float *output_data)
 {
     delete[] output_data;
+}
+
+// ============== Multi-Input/Output Session API ==============
+
+// Implemented on the MNN Express Module API — the same execution path as
+// MNN's Python `nn.load_module_from_file` (placeholder dtypes, dynamic
+// shapes). Input/output names are discovered from the model file.
+struct MNN_MultiSession
+{
+    std::mutex mutex;
+    std::string last_error;
+
+    std::shared_ptr<MNN::Express::Executor::RuntimeManager> runtime;
+    std::shared_ptr<MNN::Express::Module> module;
+
+    // Discovered model I/O metadata (module input order = discovery order)
+    std::vector<std::string> input_names;
+    std::vector<halide_type_t> input_types;
+    std::vector<std::string> output_names;
+
+    // Staged inputs: raw bytes (both f32 and i32 elements are 4 bytes)
+    std::map<std::string, std::vector<uint8_t>> staged_data;
+    std::map<std::string, std::vector<int>> staged_dims;
+
+    // Outputs of the last run, keyed by name
+    std::map<std::string, MNN::Express::VARP> last_outputs;
+};
+
+static int64_t multi_prod(const std::vector<int> &dims)
+{
+    int64_t n = 1;
+    for (int d : dims)
+    {
+        n *= d;
+    }
+    return n;
+}
+
+// Build the runtime manager + load the module for a session whose name lists
+// and input dtypes are already filled in.
+static MNNR_ErrorCode multi_finalize(MNN_MultiSession *s, const void *buffer, size_t size, const MNNR_Config *config)
+{
+    MNN::ScheduleConfig schedule;
+    MNN::BackendConfig backend;
+    init_schedule_config(schedule, backend, config);
+    s->runtime.reset(MNN::Express::Executor::RuntimeManager::createRuntimeManager(schedule),
+                     MNN::Express::Executor::RuntimeManager::destroy);
+    if (!s->runtime)
+    {
+        s->last_error = "failed to create runtime manager";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+
+    MNN::Express::Module::Config module_config;
+    module_config.shapeMutable = true;
+    s->module.reset(MNN::Express::Module::load(
+        s->input_names, s->output_names, static_cast<const uint8_t *>(buffer), size,
+        s->runtime, &module_config));
+    if (!s->module)
+    {
+        s->last_error = "Module::load failed";
+        return MNNR_ERROR_MODEL_LOAD_FAILED;
+    }
+    return MNNR_SUCCESS;
+}
+
+MNN_MultiSession *mnnr_multi_create(const void *buffer, size_t size, const MNNR_Config *config)
+{
+    if (!buffer || size == 0)
+    {
+        return nullptr;
+    }
+
+    auto s = new MNN_MultiSession();
+
+    // Discover input/output names + declared input dtypes via a throwaway
+    // Session parse. NOTE: the map loses the model graph's original input
+    // order — prefer mnnr_multi_create_named when the order is known.
+    {
+        std::unique_ptr<MNN::Interpreter> interp(MNN::Interpreter::createFromBuffer(buffer, size));
+        if (!interp)
+        {
+            delete s;
+            return nullptr;
+        }
+        MNN::ScheduleConfig schedule;
+        MNN::BackendConfig backend;
+        init_schedule_config(schedule, backend, config);
+        MNN::Session *probe = interp->createSession(schedule);
+        if (!probe)
+        {
+            delete s;
+            return nullptr;
+        }
+        for (const auto &kv : interp->getSessionInputAll(probe))
+        {
+            s->input_names.push_back(kv.first);
+            s->input_types.push_back(kv.second->getType());
+        }
+        for (const auto &kv : interp->getSessionOutputAll(probe))
+        {
+            s->output_names.push_back(kv.first);
+        }
+    }
+    if (s->input_names.empty() || s->output_names.empty())
+    {
+        delete s;
+        return nullptr;
+    }
+
+    MNNR_ErrorCode code = multi_finalize(s, buffer, size, config);
+    if (code != MNNR_SUCCESS)
+    {
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+MNN_MultiSession *mnnr_multi_create_named(
+    const void *buffer,
+    size_t size,
+    const MNNR_Config *config,
+    const char *const *input_names,
+    int32_t n_inputs,
+    const char *const *output_names,
+    int32_t n_outputs)
+{
+    if (!buffer || size == 0 || !input_names || !output_names || n_inputs <= 0 || n_outputs <= 0)
+    {
+        return nullptr;
+    }
+
+    auto s = new MNN_MultiSession();
+    for (int32_t i = 0; i < n_inputs; i++)
+    {
+        s->input_names.push_back(input_names[i]);
+    }
+    for (int32_t i = 0; i < n_outputs; i++)
+    {
+        s->output_names.push_back(output_names[i]);
+    }
+
+    // Collect declared input dtypes (by name) via a throwaway Session parse
+    {
+        std::unique_ptr<MNN::Interpreter> interp(MNN::Interpreter::createFromBuffer(buffer, size));
+        if (!interp)
+        {
+            delete s;
+            return nullptr;
+        }
+        MNN::ScheduleConfig schedule;
+        MNN::BackendConfig backend;
+        init_schedule_config(schedule, backend, config);
+        MNN::Session *probe = interp->createSession(schedule);
+        if (!probe)
+        {
+            delete s;
+            return nullptr;
+        }
+        auto all = interp->getSessionInputAll(probe);
+        for (const auto &name : s->input_names)
+        {
+            auto it = all.find(name);
+            if (it == all.end())
+            {
+                s->last_error = "input tensor not found: " + name;
+                delete s;
+                return nullptr;
+            }
+            s->input_types.push_back(it->second->getType());
+        }
+    }
+
+    MNNR_ErrorCode code = multi_finalize(s, buffer, size, config);
+    if (code != MNNR_SUCCESS)
+    {
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+void mnnr_multi_destroy(MNN_MultiSession *session)
+{
+    delete session;
+}
+
+MNNR_ErrorCode mnnr_multi_set_input(
+    MNN_MultiSession *session,
+    const char *name,
+    const int32_t *dims,
+    int32_t ndims,
+    const void *data,
+    int32_t dtype)
+{
+    if (!session || !name || !dims || !data)
+    {
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+    if (ndims <= 0 || ndims > 8 || (dtype != MNNR_DTYPE_F32 && dtype != MNNR_DTYPE_I32))
+    {
+        session->last_error = "invalid dims or dtype";
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+
+    std::vector<int> shape(dims, dims + ndims);
+    for (int d : shape)
+    {
+        if (d < 0)
+        {
+            session->last_error = "negative dimension";
+            return MNNR_ERROR_INVALID_PARAMETER;
+        }
+    }
+
+    // Validate against the declared input dtype
+    for (size_t i = 0; i < session->input_names.size(); i++)
+    {
+        if (session->input_names[i] != name)
+        {
+            continue;
+        }
+        const halide_type_t &t = session->input_types[i];
+        bool declared_int = (t.code == halide_type_int);
+        if (declared_int != (dtype == MNNR_DTYPE_I32))
+        {
+            session->last_error = std::string("dtype mismatch for ") + name +
+                                  (declared_int ? ": model expects int32" : ": model expects float32");
+            return MNNR_ERROR_INVALID_PARAMETER;
+        }
+        break;
+    }
+
+    int64_t elems = multi_prod(shape);
+    std::vector<uint8_t> bytes(static_cast<size_t>(elems) * 4);
+    std::memcpy(bytes.data(), data, bytes.size());
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->staged_data[name] = std::move(bytes);
+    session->staged_dims[name] = std::move(shape);
+    return MNNR_SUCCESS;
+}
+
+MNNR_ErrorCode mnnr_multi_run(MNN_MultiSession *session)
+{
+    if (!session)
+    {
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->staged_data.size() != session->input_names.size())
+    {
+        session->last_error = "not all inputs staged: expected " +
+                              std::to_string(session->input_names.size()) + " got " +
+                              std::to_string(session->staged_data.size());
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+
+    // Build module inputs in module input order (placeholder per input dtype)
+    std::vector<MNN::Express::VARP> inputs;
+    inputs.reserve(session->input_names.size());
+    for (size_t i = 0; i < session->input_names.size(); i++)
+    {
+        const std::string &name = session->input_names[i];
+        const std::vector<int> &dims = session->staged_dims[name];
+        const std::vector<uint8_t> &bytes = session->staged_data[name];
+        MNN::Express::VARP varp;
+        if (session->input_types[i].code == halide_type_int)
+        {
+            varp = MNN::Express::_Input(dims, MNN::Express::NCHW, halide_type_of<int>());
+            std::memcpy(varp->writeMap<int>(), bytes.data(), bytes.size());
+        }
+        else
+        {
+            varp = MNN::Express::_Input(dims, MNN::Express::NCHW, halide_type_of<float>());
+            std::memcpy(varp->writeMap<float>(), bytes.data(), bytes.size());
+        }
+        inputs.push_back(std::move(varp));
+    }
+
+    auto outputs = session->module->onForward(inputs);
+    if (outputs.size() != session->output_names.size())
+    {
+        session->last_error = "module returned unexpected output count";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+    for (size_t i = 0; i < outputs.size(); i++)
+    {
+        session->last_outputs[session->output_names[i]] = outputs[i];
+    }
+    return MNNR_SUCCESS;
+}
+
+static const MNN::Express::VARP *multi_output_locked(MNN_MultiSession *session, const char *name)
+{
+    auto it = session->last_outputs.find(name);
+    if (it == session->last_outputs.end())
+    {
+        session->last_error = std::string("output not computed (run first): ") + name;
+        return nullptr;
+    }
+    return &it->second;
+}
+
+int64_t mnnr_multi_output_elem_count(MNN_MultiSession *session, const char *name)
+{
+    if (!session || !name)
+    {
+        return -MNNR_ERROR_INVALID_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    const MNN::Express::VARP *varp = multi_output_locked(session, name);
+    if (!varp)
+    {
+        return -MNNR_ERROR_MODEL_LOAD_FAILED;
+    }
+    const auto *info = (*varp)->getInfo();
+    return info ? static_cast<int64_t>(info->size) : -MNNR_ERROR_RUNTIME_ERROR;
+}
+
+int32_t mnnr_multi_output_shape(MNN_MultiSession *session, const char *name, int64_t *dims, int32_t cap)
+{
+    if (!session || !name || !dims || cap <= 0)
+    {
+        return -MNNR_ERROR_INVALID_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    const MNN::Express::VARP *varp = multi_output_locked(session, name);
+    if (!varp)
+    {
+        return -MNNR_ERROR_MODEL_LOAD_FAILED;
+    }
+    const auto *info = (*varp)->getInfo();
+    if (!info)
+    {
+        session->last_error = "output info unavailable";
+        return -MNNR_ERROR_RUNTIME_ERROR;
+    }
+    int32_t ndims = static_cast<int32_t>(info->dim.size());
+    if (ndims > cap)
+    {
+        session->last_error = "shape buffer too small";
+        return -MNNR_ERROR_INVALID_PARAMETER;
+    }
+    for (int32_t i = 0; i < ndims; i++)
+    {
+        dims[i] = info->dim[i];
+    }
+    return ndims;
+}
+
+MNNR_ErrorCode mnnr_multi_output_f32(MNN_MultiSession *session, const char *name, float *out, int64_t cap_elems)
+{
+    if (!session || !name || !out)
+    {
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    const MNN::Express::VARP *varp = multi_output_locked(session, name);
+    if (!varp)
+    {
+        return MNNR_ERROR_MODEL_LOAD_FAILED;
+    }
+    const auto *info = (*varp)->getInfo();
+    if (!info)
+    {
+        session->last_error = "output info unavailable";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+    int64_t elems = static_cast<int64_t>(info->size);
+    if (elems > cap_elems)
+    {
+        session->last_error = "output buffer too small";
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+    const float *host = (*varp)->readMap<float>();
+    if (!host)
+    {
+        session->last_error = "output readMap failed";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+    std::memcpy(out, host, static_cast<size_t>(elems) * sizeof(float));
+    return MNNR_SUCCESS;
+}
+
+const char *mnnr_multi_last_error(MNN_MultiSession *session)
+{
+    if (!session)
+    {
+        return "null session";
+    }
+    return session->last_error.c_str();
 }

@@ -908,6 +908,7 @@ fn bind_gen(
         .allowlist_function("mnnr_.*")
         .allowlist_type("MNN.*")
         .allowlist_type("MNNR.*")
+        .allowlist_var("MNNR_.*")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .layout_tests(false);
 

@@ -772,6 +772,264 @@ mod normal_impl {
     unsafe impl Send for SessionPool {}
     unsafe impl Sync for SessionPool {}
 
+    // ============== Multi-Input Session ==============
+
+    /// Input element type for [`MultiSession::set_input`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MultiDType {
+        F32,
+        I32,
+    }
+
+    /// A session over a model with several named input tensors and one or more
+    /// named float outputs (e.g. TTS: text ids + style vectors + masks).
+    /// Inputs are staged by name and applied on [`MultiSession::run`]; shape
+    /// changes trigger an MNN session resize.
+    ///
+    /// Safety: `&mut self` serializes all calls; the underlying MNN session is
+    /// not thread-safe, and `Send` (without `Sync`) allows one owner to move
+    /// the session across threads.
+    pub struct MultiSession {
+        ptr: NonNull<ffi::MNN_MultiSession>,
+    }
+
+    impl MultiSession {
+        /// Create a multi-input session from model byte data.
+        pub fn from_buffer(model_buffer: &[u8], config: Option<InferenceConfig>) -> Result<Self> {
+            if model_buffer.is_empty() {
+                return Err(MnnError::InvalidParameter(
+                    "Model data is empty".to_string(),
+                ));
+            }
+            let cfg = config.unwrap_or_default();
+            cfg.backend.ensure_available()?;
+            let c_config = cfg.to_ffi();
+
+            let ptr = unsafe {
+                ffi::mnnr_multi_create(
+                    model_buffer.as_ptr() as *const _,
+                    model_buffer.len(),
+                    &c_config,
+                )
+            };
+            let ptr = NonNull::new(ptr)
+                .ok_or_else(|| MnnError::ModelLoadFailed("Model load failed".to_string()))?;
+            Ok(MultiSession { ptr })
+        }
+
+        /// Create a multi-input session from a model file.
+        pub fn from_file(
+            model_path: impl AsRef<std::path::Path>,
+            config: Option<InferenceConfig>,
+        ) -> Result<Self> {
+            let model_buffer = std::fs::read(model_path.as_ref()).map_err(|e| {
+                MnnError::ModelLoadFailed(format!("Failed to read model file: {}", e))
+            })?;
+            Self::from_buffer(&model_buffer, config)
+        }
+
+        /// Create a multi-input session with explicit input/output names, in
+        /// the model graph's input order (MNN binds module inputs
+        /// positionally, so the order must match the model, e.g. the order
+        /// the converter/Python loader feeds them).
+        pub fn from_file_named(
+            model_path: impl AsRef<std::path::Path>,
+            config: Option<InferenceConfig>,
+            input_names: &[&str],
+            output_names: &[&str],
+        ) -> Result<Self> {
+            let model_buffer = std::fs::read(model_path.as_ref()).map_err(|e| {
+                MnnError::ModelLoadFailed(format!("Failed to read model file: {}", e))
+            })?;
+            Self::from_buffer_named(&model_buffer, config, input_names, output_names)
+        }
+
+        /// [`Self::from_file_named`] over raw model bytes.
+        pub fn from_buffer_named(
+            model_buffer: &[u8],
+            config: Option<InferenceConfig>,
+            input_names: &[&str],
+            output_names: &[&str],
+        ) -> Result<Self> {
+            if model_buffer.is_empty() {
+                return Err(MnnError::InvalidParameter(
+                    "Model data is empty".to_string(),
+                ));
+            }
+            let cfg = config.unwrap_or_default();
+            cfg.backend.ensure_available()?;
+            let c_config = cfg.to_ffi();
+
+            let c_inputs: Vec<std::ffi::CString> = input_names
+                .iter()
+                .map(|n| std::ffi::CString::new(*n))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| MnnError::InvalidParameter("input name has NUL".to_string()))?;
+            let c_outputs: Vec<std::ffi::CString> = output_names
+                .iter()
+                .map(|n| std::ffi::CString::new(*n))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| MnnError::InvalidParameter("output name has NUL".to_string()))?;
+            let input_ptrs: Vec<*const std::os::raw::c_char> =
+                c_inputs.iter().map(|c| c.as_ptr()).collect();
+            let output_ptrs: Vec<*const std::os::raw::c_char> =
+                c_outputs.iter().map(|c| c.as_ptr()).collect();
+
+            let ptr = unsafe {
+                ffi::mnnr_multi_create_named(
+                    model_buffer.as_ptr() as *const _,
+                    model_buffer.len(),
+                    &c_config,
+                    input_ptrs.as_ptr(),
+                    input_ptrs.len() as i32,
+                    output_ptrs.as_ptr(),
+                    output_ptrs.len() as i32,
+                )
+            };
+            let ptr = NonNull::new(ptr)
+                .ok_or_else(|| MnnError::ModelLoadFailed("Model load failed".to_string()))?;
+            Ok(MultiSession { ptr })
+        }
+
+        fn check(code: ffi::MNNR_ErrorCode, ptr: NonNull<ffi::MNN_MultiSession>) -> Result<()> {
+            if code == ffi::MNNR_ErrorCode_MNNR_SUCCESS {
+                return Ok(());
+            }
+            let detail = unsafe {
+                let c_str = ffi::mnnr_multi_last_error(ptr.as_ptr());
+                if c_str.is_null() {
+                    String::new()
+                } else {
+                    format!(": {}", CStr::from_ptr(c_str).to_string_lossy())
+                }
+            };
+            Err(match code {
+                ffi::MNNR_ErrorCode_MNNR_ERROR_INVALID_PARAMETER => {
+                    MnnError::InvalidParameter(detail)
+                }
+                ffi::MNNR_ErrorCode_MNNR_ERROR_OUT_OF_MEMORY => MnnError::OutOfMemory,
+                ffi::MNNR_ErrorCode_MNNR_ERROR_MODEL_LOAD_FAILED => {
+                    MnnError::ModelLoadFailed(detail)
+                }
+                _ => MnnError::RuntimeError(detail),
+            })
+        }
+
+        /// Stage one named input tensor (data is copied; applied on `run`).
+        pub fn set_input(&mut self, name: &str, dims: &[i32], data: MultiInput<'_>) -> Result<()> {
+            let c_name = std::ffi::CString::new(name)
+                .map_err(|_| MnnError::InvalidParameter("input name has NUL".to_string()))?;
+            let (ptr, len, dtype) = match data {
+                MultiInput::F32(slice) => (
+                    slice.as_ptr() as *const _,
+                    slice.len(),
+                    ffi::MNNR_DTYPE_F32 as i32,
+                ),
+                MultiInput::I32(slice) => (
+                    slice.as_ptr() as *const _,
+                    slice.len(),
+                    ffi::MNNR_DTYPE_I32 as i32,
+                ),
+            };
+            let expected: usize = dims.iter().map(|&d| d.max(0) as usize).product();
+            if expected != len {
+                return Err(MnnError::ShapeMismatch {
+                    expected: vec![expected],
+                    got: vec![len],
+                });
+            }
+            let code = unsafe {
+                ffi::mnnr_multi_set_input(
+                    self.ptr.as_ptr(),
+                    c_name.as_ptr(),
+                    dims.as_ptr(),
+                    dims.len() as i32,
+                    ptr,
+                    dtype,
+                )
+            };
+            Self::check(code, self.ptr)
+        }
+
+        /// Apply staged inputs and run one inference.
+        pub fn run(&mut self) -> Result<()> {
+            let code = unsafe { ffi::mnnr_multi_run(self.ptr.as_ptr()) };
+            Self::check(code, self.ptr)
+        }
+
+        /// Shape (axis sizes) of one named output tensor.
+        pub fn output_shape(&mut self, name: &str) -> Result<Vec<i64>> {
+            let c_name = std::ffi::CString::new(name)
+                .map_err(|_| MnnError::InvalidParameter("output name has NUL".to_string()))?;
+            let mut dims = vec![0i64; 8];
+            let ndims = unsafe {
+                ffi::mnnr_multi_output_shape(
+                    self.ptr.as_ptr(),
+                    c_name.as_ptr(),
+                    dims.as_mut_ptr(),
+                    dims.len() as i32,
+                )
+            };
+            if ndims < 0 {
+                Self::check((-ndims) as u32, self.ptr)?;
+                return Err(MnnError::RuntimeError("output shape failed".to_string()));
+            }
+            dims.truncate(ndims as usize);
+            Ok(dims)
+        }
+
+        /// Copy one named float output into a freshly allocated vector.
+        pub fn output_f32(&mut self, name: &str) -> Result<Vec<f32>> {
+            let c_name = std::ffi::CString::new(name)
+                .map_err(|_| MnnError::InvalidParameter("output name has NUL".to_string()))?;
+            let count =
+                unsafe { ffi::mnnr_multi_output_elem_count(self.ptr.as_ptr(), c_name.as_ptr()) };
+            if count < 0 {
+                Self::check((-count) as u32, self.ptr)?;
+                return Err(MnnError::RuntimeError(
+                    "output element count failed".to_string(),
+                ));
+            }
+            let mut out = vec![0f32; count as usize];
+            let code = unsafe {
+                ffi::mnnr_multi_output_f32(
+                    self.ptr.as_ptr(),
+                    c_name.as_ptr(),
+                    out.as_mut_ptr(),
+                    out.len() as i64,
+                )
+            };
+            Self::check(code, self.ptr)?;
+            Ok(out)
+        }
+
+        /// Last error message from the native session, if any.
+        pub fn last_error(&self) -> String {
+            unsafe {
+                let c_str = ffi::mnnr_multi_last_error(self.ptr.as_ptr());
+                if c_str.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(c_str).to_string_lossy().into_owned()
+                }
+            }
+        }
+    }
+
+    /// Staged input payload for [`MultiSession::set_input`].
+    pub enum MultiInput<'a> {
+        F32(&'a [f32]),
+        I32(&'a [i32]),
+    }
+
+    impl Drop for MultiSession {
+        fn drop(&mut self) {
+            unsafe { ffi::mnnr_multi_destroy(self.ptr.as_ptr()) }
+        }
+    }
+
+    unsafe impl Send for MultiSession {}
+
     // ============== Utility Functions ==============
 
     /// Get MNN version number

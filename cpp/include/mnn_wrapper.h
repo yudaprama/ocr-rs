@@ -179,6 +179,74 @@ extern "C"
     // Free output buffer allocated by mnnr_run_inference_dynamic
     void mnnr_free_output(float *output_data);
 
+    // ============== Multi-Input/Output Session API ==============
+
+    // Session for models with several named input tensors (e.g. TTS: text ids,
+    // style vectors, masks). All dtypes are fixed by the model; inputs are
+    // staged by name, applied on run. Outputs are read back as float32.
+    typedef struct MNN_MultiSession MNN_MultiSession;
+
+    // Input element data type for mnnr_multi_set_input
+    #define MNNR_DTYPE_F32 0
+    #define MNNR_DTYPE_I32 1
+
+    // Create a multi-input session from a model buffer. Returns NULL on failure.
+    MNN_MultiSession *mnnr_multi_create(
+        const void *buffer,
+        size_t size,
+        const MNNR_Config *config);
+
+    // Create a multi-input session with explicit input/output names, in the
+    // model graph's input order (the order MNN's Module::load binds inputs
+    // positionally). Names must match the model's tensors. Returns NULL on failure.
+    MNN_MultiSession *mnnr_multi_create_named(
+        const void *buffer,
+        size_t size,
+        const MNNR_Config *config,
+        const char *const *input_names,
+        int32_t n_inputs,
+        const char *const *output_names,
+        int32_t n_outputs);
+
+    // Destroy a multi-input session
+    void mnnr_multi_destroy(MNN_MultiSession *session);
+
+    // Stage one input tensor. The data is copied; shapes apply on the next
+    // mnnr_multi_run. dims are element counts per axis (row-major).
+    MNNR_ErrorCode mnnr_multi_set_input(
+        MNN_MultiSession *session,
+        const char *name,
+        const int32_t *dims,
+        int32_t ndims,
+        const void *data,
+        int32_t dtype);
+
+    // Apply staged inputs (resizing the session when shapes changed) and run
+    // one inference.
+    MNNR_ErrorCode mnnr_multi_run(MNN_MultiSession *session);
+
+    // Copy one named output tensor (as float32) into `out`. The buffer must
+    // hold at least mnnr_multi_output_elem_count elements.
+    MNNR_ErrorCode mnnr_multi_output_f32(
+        MNN_MultiSession *session,
+        const char *name,
+        float *out,
+        int64_t cap_elems);
+
+    // Number of elements in one named output tensor (negative on error).
+    int64_t mnnr_multi_output_elem_count(MNN_MultiSession *session, const char *name);
+
+    // Write one named output tensor's shape into `dims` (up to `cap` axes).
+    // Returns the axis count, or a negative MNNR error code.
+    int32_t mnnr_multi_output_shape(
+        MNN_MultiSession *session,
+        const char *name,
+        int64_t *dims,
+        int32_t cap);
+
+    // Get last error message from a multi-input session
+    const char *mnnr_multi_last_error(MNN_MultiSession *session);
+
 #ifdef __cplusplus
 }
 #endif
