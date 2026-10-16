@@ -971,7 +971,7 @@ mod normal_impl {
                 )
             };
             if ndims < 0 {
-                Self::check((-ndims) as u32, self.ptr)?;
+                Self::check((-ndims) as ffi::MNNR_ErrorCode, self.ptr)?;
                 return Err(MnnError::RuntimeError("output shape failed".to_string()));
             }
             dims.truncate(ndims as usize);
@@ -985,7 +985,7 @@ mod normal_impl {
             let count =
                 unsafe { ffi::mnnr_multi_output_elem_count(self.ptr.as_ptr(), c_name.as_ptr()) };
             if count < 0 {
-                Self::check((-count) as u32, self.ptr)?;
+                Self::check((-count) as ffi::MNNR_ErrorCode, self.ptr)?;
                 return Err(MnnError::RuntimeError(
                     "output element count failed".to_string(),
                 ));
