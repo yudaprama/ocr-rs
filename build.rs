@@ -849,6 +849,18 @@ fn link_libraries(
 }
 
 fn emit_static_cpp_runtime_search_paths(target: &TargetInfo<'_>, features: &BuildFeatures) {
+    if target.os == "android" {
+        if let Some(directory) = android_cpp_runtime_dir(target) {
+            println!("cargo:rustc-link-search=native={}", directory.display());
+        } else {
+            panic!(
+                "Android NDK sysroot dir for libc++_static.a not found for target {}",
+                target.triple
+            );
+        }
+        return;
+    }
+
     if target.os != "windows" || target.env != "gnu" || !features.static_cpp_runtime {
         return;
     }
@@ -892,6 +904,38 @@ fn emit_static_cpp_runtime_search_paths(target: &TargetInfo<'_>, features: &Buil
             println!("cargo:rustc-link-search=native={}", directory.display());
         }
     }
+}
+
+/// Locates the NDK sysroot directory holding `libc++_static.a` for the target
+/// (`$NDK/toolchains/llvm/prebuilt/<host>/sysroot/usr/lib/<triple>/`). rustc
+/// resolves native static libraries itself — it never consults the linker's
+/// default search paths — so a `-L` for this directory is required or the
+/// `static=c++_static` link directive fails with "could not find native
+/// static library".
+fn android_cpp_runtime_dir(target: &TargetInfo<'_>) -> Option<PathBuf> {
+    let ndk = env::var("ANDROID_NDK_ROOT")
+        .or_else(|_| env::var("ANDROID_NDK_HOME"))
+        .or_else(|_| env::var("ANDROID_NDK"))
+        .or_else(|_| env::var("NDK_HOME"))
+        .ok()?;
+
+    // Rust's armv7 triple is `armv7-linux-androideabi`; the NDK sysroot dir is
+    // `armv7a-linux-androideabi`. All other android triples match verbatim.
+    let triple = if target.arch == "arm" {
+        "armv7a-linux-androideabi"
+    } else {
+        target.triple
+    };
+
+    let prebuilt = Path::new(&ndk).join("toolchains/llvm/prebuilt");
+    let archive_name = "libc++_static.a";
+    for entry in fs::read_dir(&prebuilt).ok()?.flatten() {
+        let candidate = entry.path().join("sysroot/usr/lib").join(triple);
+        if candidate.join(&archive_name).is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn bind_gen(
