@@ -850,8 +850,23 @@ fn link_libraries(
 
 fn emit_static_cpp_runtime_search_paths(target: &TargetInfo<'_>, features: &BuildFeatures) {
     if target.os == "android" {
+        // The NDK dir holding libc++_static.a is version-less and contains
+        // ONLY static archives — including the NDK's own libc.a and no
+        // libc.so. Putting it on the library search path therefore makes
+        // rustc's trailing `-lc` resolve to libc.a, silently linking all of
+        // bionic statically into the final artifact. Every Rust ELF
+        // constructor that calls getauxval (compiler-builtins' aarch64 LSE
+        // detection) then reads the never-initialized __libc_shared_globals
+        // and segfaults at load time. Stage the C++ runtime archive into a
+        // private directory and put THAT on the search path instead.
         if let Some(directory) = android_cpp_runtime_dir(target) {
-            println!("cargo:rustc-link-search=native={}", directory.display());
+            let staging = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is not set"))
+                .join("cxx-runtime");
+            std::fs::create_dir_all(&staging).expect("Failed to create cxx-runtime staging dir");
+            let staged = staging.join("libc++_static.a");
+            std::fs::copy(directory.join("libc++_static.a"), &staged)
+                .expect("Failed to stage libc++_static.a");
+            println!("cargo:rustc-link-search=native={}", staging.display());
         } else {
             panic!(
                 "Android NDK sysroot dir for libc++_static.a not found for target {}",
